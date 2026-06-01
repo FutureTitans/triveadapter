@@ -29,6 +29,38 @@ def get_model():
 
     try:
         from tribev2 import TribeModel
+        import tribev2.eventstransforms
+
+        # Monkey-patch the hardcoded float16 in ExtractWordsFromAudio
+        # which fails on CPU (like AWS t3 instances)
+        original_get_transcript = tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio
+
+        @staticmethod
+        def _patched_get_transcript(wav_filename: Path, language: str):
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cpu":
+                # Override the compute type internally by hooking subprocess
+                import subprocess
+                orig_run = subprocess.run
+                def hooked_run(*args, **kwargs):
+                    if args and isinstance(args[0], list) and "whisperx" in args[0]:
+                        try:
+                            idx = args[0].index("--compute_type")
+                            args[0][idx+1] = "int8"
+                        except ValueError:
+                            pass
+                    return orig_run(*args, **kwargs)
+                
+                subprocess.run = hooked_run
+                try:
+                    return original_get_transcript.__func__(wav_filename, language)
+                finally:
+                    subprocess.run = orig_run
+            else:
+                return original_get_transcript.__func__(wav_filename, language)
+
+        tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio = _patched_get_transcript
 
         os.makedirs(CACHE_DIR, exist_ok=True)
         hf_token = os.getenv("HF_TOKEN")
