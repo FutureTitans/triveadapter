@@ -6,9 +6,20 @@ and returns brain activation predictions with ROI scores.
 """
 
 import os
+import logging
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CRITICAL: Force CPU mode BEFORE importing torch or any ML library.
+# The Docker image ships PyTorch compiled with CUDA stubs, which makes
+# torch.cuda.is_available() return True even on CPU-only servers.
+# This single line forces ALL downstream libraries (TRIBE v2, neuralset,
+# transformers, whisperx, ctranslate2) to use CPU — eliminating every
+# "Found no NVIDIA driver" crash in one shot.
+# ══════════════════════════════════════════════════════════════════════════════
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import numpy as np
 import tempfile
-import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -16,6 +27,226 @@ logger = logging.getLogger(__name__)
 # ── Model Singleton ──────────────────────────────────────────────────────────
 _model = None
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
+
+
+def _apply_cpu_patches():
+    """
+    Apply all monkey-patches needed to run TRIBE v2 on a CPU-only server.
+    Called once before loading the model.
+    """
+    import torch
+    import tribev2.eventstransforms
+    import neuralset.extractors.text
+
+    # ── Patch 1: WhisperX compute_type ────────────────────────────────────
+    # TRIBE v2 hardcodes compute_type="float16" for whisperx transcription.
+    # float16 is only supported on CUDA. On CPU we must use "int8".
+    original_get_transcript = (
+        tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio
+    )
+
+    @staticmethod
+    def _patched_get_transcript(wav_filename, language="english"):
+        import subprocess
+
+        orig_run = subprocess.run
+
+        def hooked_run(*args, **kwargs):
+            if args and isinstance(args[0], list) and "whisperx" in args[0]:
+                try:
+                    idx = args[0].index("--compute_type")
+                    args[0][idx + 1] = "int8"
+                except ValueError:
+                    pass
+                # Also force device to cpu
+                try:
+                    idx = args[0].index("--device")
+                    args[0][idx + 1] = "cpu"
+                except ValueError:
+                    pass
+            return orig_run(*args, **kwargs)
+
+        subprocess.run = hooked_run
+        try:
+            return original_get_transcript(wav_filename, language)
+        finally:
+            subprocess.run = orig_run
+
+    tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio = (
+        _patched_get_transcript
+    )
+
+    # ── Patch 2: HuggingFaceText model loading ────────────────────────────
+    # neuralset's _load_model calls model.to(self.device) which crashes if
+    # self.device resolved to "cuda" at class-definition time.
+    # We completely replace _load_model for CPU to:
+    #   a) Use bfloat16 to halve memory usage
+    #   b) Skip the model.to("cuda") call entirely
+    #   c) Handle all model types correctly
+
+    def _patched_load_model(self, **kwargs):
+        kwargs["low_cpu_mem_usage"] = True
+        kwargs["torch_dtype"] = torch.bfloat16
+
+        from transformers import AutoModel
+
+        if "t5" in self.model_name or "bert" in self.model_name:
+            from transformers import AutoModelForTextEncoding as Model
+        elif "Phi-3" in self.model_name:
+            from transformers import AutoModelForCausalLM as Model
+        elif "Llama-3.2-11B-Vision" in self.model_name:
+            from transformers import MllamaForConditionalGeneration as Model
+        else:
+            Model = AutoModel
+
+        model = Model.from_pretrained(self.model_name, **kwargs)
+
+        if not getattr(self, "pretrained", True):
+            rawmodel = Model.from_config(model.config)
+            with torch.no_grad():
+                import itertools
+                for p1, p2 in itertools.zip_longest(
+                    model.parameters(), rawmodel.parameters()
+                ):
+                    p1.data = p2.to(p1)
+
+        model.to("cpu")
+        model.eval()
+        return model
+
+    neuralset.extractors.text.HuggingFaceText._load_model = _patched_load_model
+
+    # ── Patch 3: HuggingFaceText.model property ──────────────────────────
+    # The original property wraps exceptions in "Model loading went wrong"
+    # which hides the real error. We replace it to print the full traceback.
+    # We also use object.__setattr__ to bypass Pydantic's frozen model.
+
+    @property
+    def _patched_model_prop(self):
+        if not hasattr(self, "_model"):
+            from transformers import AutoTokenizer
+
+            kwargs = {}
+            if self.model_name.lower().startswith("microsoft/phi"):
+                kwargs["trust_remote_code"] = True
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, truncation_side="left", **kwargs
+            )
+            if self._tokenizer.pad_token is None:
+                self._tokenizer.pad_token = self._tokenizer.eos_token
+            # Use object.__setattr__ to bypass Pydantic freeze
+            object.__setattr__(self, "_pad_id", self._tokenizer.eos_token_id)
+            try:
+                loaded = self._load_model()
+                object.__setattr__(self, "_model", loaded)
+            except Exception as e:
+                import traceback
+
+                traceback.print_exc()
+                logger.error(f"Model loading error: {e}")
+                raise RuntimeError(f"Model loading failed: {e}") from e
+        return self._model
+
+    neuralset.extractors.text.HuggingFaceText.model = _patched_model_prop
+
+    # ── Patch 4: Force device to "cpu" on HuggingFaceText._get_data ──────
+    # The _get_data method reads self.device and may try to send tensors to
+    # "cuda". We override _get_data to force device="cpu".
+    original_get_data = neuralset.extractors.text.HuggingFaceText._get_data.__wrapped__
+
+    def _patched_get_data(self, events):
+        from neuralset.extractors.text import TextDataset
+        from torch.utils.data import DataLoader
+        from exca.utils import environment_variables
+        from tqdm import tqdm
+
+        dataset = TextDataset(events)
+        dloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+
+        if len(dloader) > 1:
+            dloader = tqdm(dloader, desc="Computing word embeddings")
+
+        # Force CPU — this is the key fix
+        device = "cpu"
+
+        with torch.no_grad():
+            for target_words, context in dloader:
+                with environment_variables(TOKENIZERS_PARALLELISM="false"):
+                    text = context if self.contextualized else target_words
+                    if isinstance(text, tuple):
+                        text = list(text)
+                    if not all(text):
+                        raise ValueError(
+                            f"Empty text or context for target_words {target_words!r}"
+                        )
+                    inputs = self.tokenizer(
+                        text,
+                        add_special_tokens=False,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                    ).to(device)
+                outputs = self.model(**inputs, output_hidden_states=True)
+                if "hidden_states" in outputs:
+                    states = outputs.hidden_states
+                else:
+                    states = (
+                        outputs.encoder_hidden_states + outputs.decoder_hidden_states
+                    )
+                hidden_states = torch.stack([layer.cpu() for layer in states])
+                n_layers, n_batch, n_tokens, n_dims = hidden_states.shape
+
+                for i, target_word in enumerate(target_words):
+                    hidden_state = hidden_states[:, i]
+                    n_pads = sum(
+                        inputs["input_ids"][i].cpu().numpy() == self._pad_id
+                    )
+                    if n_pads:
+                        hidden_state = hidden_state[:, :-n_pads]
+                    if self.contextualized:
+                        prefix = context[i][: -len(target_word)].rstrip()
+                        n_prefix = (
+                            len(
+                                self.tokenizer.encode(
+                                    prefix, add_special_tokens=False
+                                )
+                            )
+                            if prefix
+                            else 0
+                        )
+                        n_target = n_tokens - n_pads - n_prefix
+                        word_state = hidden_state[:, -max(1, n_target) :]
+                    else:
+                        word_state = hidden_state
+                    word_state = self._aggregate_tokens(word_state)
+                    out = word_state.cpu().numpy()
+                    if not self.cache_all_layers and self.cache_n_layers is None:
+                        out = self._aggregate_layers(out)
+                    if np.isnan(out).any():
+                        raise ValueError(
+                            f"NaN in output for target_word {target_word}"
+                        )
+                    yield out
+                del hidden_states, hidden_state, word_state, states, outputs, inputs
+
+    # Try to replace _get_data; if infra.apply wrapping makes it tricky,
+    # fall back gracefully
+    try:
+        import exca
+
+        @neuralset.extractors.text.HuggingFaceText.infra.apply(
+            item_uid=lambda event: f"{event.text}_{getattr(event, 'context', '')}",
+            exclude_from_cache_uid="method:_exclude_from_cache_uid",
+            cache_type="MemmapArrayFile",
+        )
+        def _wrapped_get_data(self, events):
+            return _patched_get_data(self, events)
+
+        neuralset.extractors.text.HuggingFaceText._get_data = _wrapped_get_data
+    except Exception as e:
+        logger.warning(f"Could not patch _get_data (non-critical): {e}")
+
+    logger.info("CPU patches applied successfully.")
 
 
 def get_model():
@@ -29,99 +260,11 @@ def get_model():
 
     try:
         from tribev2 import TribeModel
-        import tribev2.eventstransforms
 
-        # Monkey-patch the hardcoded float16 in ExtractWordsFromAudio
-        # which fails on CPU (like AWS t3 instances)
-        original_get_transcript = tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio
-
-        @staticmethod
-        def _patched_get_transcript(wav_filename: Path, language: str):
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if device == "cpu":
-                # Override the compute type internally by hooking subprocess
-                import subprocess
-                orig_run = subprocess.run
-                def hooked_run(*args, **kwargs):
-                    if args and isinstance(args[0], list) and "whisperx" in args[0]:
-                        try:
-                            idx = args[0].index("--compute_type")
-                            args[0][idx+1] = "int8"
-                        except ValueError:
-                            pass
-                    return orig_run(*args, **kwargs)
-                
-                subprocess.run = hooked_run
-                try:
-                    return original_get_transcript(wav_filename, language)
-                finally:
-                    subprocess.run = orig_run
-            else:
-                return original_get_transcript(wav_filename, language)
-
-        tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio = _patched_get_transcript
-
-        # Monkey-patch neuralset's HuggingFaceText to use float32 or int8
-        # and print the exact exception if it fails
-        import neuralset.extractors.text
-        original_load_model = neuralset.extractors.text.HuggingFaceText._load_model
-
-        def _patched_load_model(self, **kwargs):
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if device == "cpu":
-                kwargs["low_cpu_mem_usage"] = True
-                kwargs["torch_dtype"] = torch.bfloat16 
-                
-                # Load it ourselves to completely bypass Pydantic freezing 
-                # and the hardcoded model.to("cuda") in the original method
-                from transformers import AutoModel
-                if "t5" in self.model_name or "bert" in self.model_name:
-                    from transformers import AutoModelForTextEncoding as Model
-                elif "Phi-3" in self.model_name:
-                    from transformers import AutoModelForCausalLM as Model
-                elif "Llama-3.2-11B-Vision" in self.model_name:
-                    from transformers import MllamaForConditionalGeneration as Model
-                else:
-                    Model = AutoModel
-                
-                model = Model.from_pretrained(self.model_name, **kwargs)
-                model.eval()
-                return model
-                
-            return original_load_model(self, **kwargs)
-
-        neuralset.extractors.text.HuggingFaceText._load_model = _patched_load_model
-
-        # Also patch the property to print the real error
-        original_model_prop = neuralset.extractors.text.HuggingFaceText.model
-        @property
-        def _patched_model_prop(self):
-            if not hasattr(self, "_model"):
-                from transformers import AutoTokenizer
-                kwargs = {}
-                if self.model_name.lower().startswith("microsoft/phi"):
-                    kwargs["trust_remote_code"] = True
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_name, truncation_side="left", **kwargs
-                )
-                if self._tokenizer.pad_token is None:
-                    self._tokenizer.pad_token = self._tokenizer.eos_token
-                self._pad_id = self._tokenizer.eos_token_id
-                try:
-                    self._model = self._load_model()
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    logger.error(f"REAL LLAMA ERROR: {str(e)}")
-                    raise RuntimeError(f"Model loading went wrong: {str(e)}") from e
-            return self._model
-            
-        neuralset.extractors.text.HuggingFaceText.model = _patched_model_prop
+        # Apply all CPU compatibility patches
+        _apply_cpu_patches()
 
         os.makedirs(CACHE_DIR, exist_ok=True)
-        hf_token = os.getenv("HF_TOKEN")
         logger.info("Loading TRIBE v2 model (first load downloads ~10GB)...")
         _model = TribeModel.from_pretrained(
             "facebook/tribev2",
@@ -344,4 +487,3 @@ def _compute_timeline_from_temporal(preds_2d: np.ndarray) -> list:
         timeline.append({"time": t, "engagement_score": round(float(score), 1)})
 
     return timeline
-
