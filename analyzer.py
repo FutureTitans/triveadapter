@@ -35,6 +35,7 @@ def _apply_cpu_patches():
     Called once before loading the model.
     """
     import torch
+    import torchvision  # REQUIRED to register C++ operators like torchvision::nms!
     import tribev2.eventstransforms
     import neuralset.extractors.text
 
