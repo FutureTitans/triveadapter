@@ -71,9 +71,25 @@ def get_model():
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
             if device == "cpu":
-                self.device = "cpu"  # Force the model to load on CPU!
                 kwargs["low_cpu_mem_usage"] = True
                 kwargs["torch_dtype"] = torch.bfloat16 
+                
+                # Load it ourselves to completely bypass Pydantic freezing 
+                # and the hardcoded model.to("cuda") in the original method
+                from transformers import AutoModel
+                if "t5" in self.model_name or "bert" in self.model_name:
+                    from transformers import AutoModelForTextEncoding as Model
+                elif "Phi-3" in self.model_name:
+                    from transformers import AutoModelForCausalLM as Model
+                elif "Llama-3.2" in self.model_name:
+                    from transformers import MllamaForConditionalGeneration as Model
+                else:
+                    Model = AutoModel
+                
+                model = Model.from_pretrained(self.model_name, **kwargs)
+                model.eval()
+                return model
+                
             return original_load_model(self, **kwargs)
 
         neuralset.extractors.text.HuggingFaceText._load_model = _patched_load_model
