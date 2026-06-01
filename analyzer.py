@@ -54,11 +54,11 @@ def get_model():
                 
                 subprocess.run = hooked_run
                 try:
-                    return original_get_transcript.__func__(wav_filename, language)
+                    return original_get_transcript(wav_filename, language)
                 finally:
                     subprocess.run = orig_run
             else:
-                return original_get_transcript.__func__(wav_filename, language)
+                return original_get_transcript(wav_filename, language)
 
         tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio = _patched_get_transcript
 
