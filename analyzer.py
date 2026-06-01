@@ -307,18 +307,16 @@ def _calculate_viral_score(roi_scores: dict) -> float:
     return round(max(0, min(100, score)), 1)
 
 
-def _generate_mock_brain_data() -> np.ndarray:
-    """Generate realistic mock brain data when the real model isn't available."""
-    np.random.seed(42)
+def _generate_mock_brain_data(content_hash: int = 0) -> np.ndarray:
+    """Generate mock brain data seeded by input content so different inputs give different results."""
+    rng = np.random.RandomState(content_hash & 0xFFFFFFFF)
     n_vertices = 20484  # fsaverage5
 
-    # Start with a base pattern
-    base = np.random.randn(n_vertices) * 0.3
+    base = rng.randn(n_vertices) * 0.3
 
-    # Add regional hotspots for more realistic patterns
     for region, (start, end) in ROI_REGIONS.items():
-        intensity = np.random.uniform(0.3, 1.0)
-        base[start:end] += np.random.randn(end - start) * intensity + intensity
+        intensity = rng.uniform(0.3, 1.0)
+        base[start:end] += rng.randn(end - start) * intensity + intensity
 
     return base
 
@@ -328,11 +326,18 @@ async def analyze_content(file_path: str = None, text: str = None) -> dict:
     Main analysis pipeline. Accepts a file path (video/audio) or raw text.
     Returns brain activation data, ROI scores, timeline, and viral score.
     """
+    # Derive a content hash so mock fallback varies per input
+    if text:
+        content_hash = hash(text)
+    elif file_path:
+        content_hash = hash(Path(file_path).name + str(Path(file_path).stat().st_size))
+    else:
+        content_hash = 0
+
     model = get_model()
-    preds_2d = None  # (n_timesteps, n_vertices) for real temporal data
+    preds_2d = None
 
     if model is not None:
-        # ── Real TRIBE v2 inference ──────────────────────────────────────
         try:
             if file_path:
                 ext = Path(file_path).suffix.lower()
@@ -346,7 +351,6 @@ async def analyze_content(file_path: str = None, text: str = None) -> dict:
                     events_df = model.get_events_dataframe(video_path=file_path)
                 preds, segments = model.predict(events=events_df)
             elif text:
-                # For text, create a temporary file
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".txt", delete=False
                 ) as f:
@@ -362,20 +366,19 @@ async def analyze_content(file_path: str = None, text: str = None) -> dict:
 
             preds = np.array(preds, dtype=np.float64)
 
-            # preds is (n_timesteps, n_vertices)
             if preds.ndim > 1:
                 preds_2d = preds
-                brain_data = preds.mean(axis=0)  # Average over time for spatial map
+                brain_data = preds.mean(axis=0)
             else:
                 brain_data = preds
 
         except Exception as e:
             logger.error(f"TRIBE v2 inference failed: {e}")
             logger.info("Falling back to mock brain data...")
-            brain_data = _generate_mock_brain_data()
+            brain_data = _generate_mock_brain_data(content_hash)
     else:
         logger.info("Model not loaded. Falling back to mock brain data for analysis.")
-        brain_data = _generate_mock_brain_data()
+        brain_data = _generate_mock_brain_data(content_hash)
 
     # ── Compute derived metrics ──────────────────────────────────────────
     roi_scores = _compute_roi_scores(brain_data)
