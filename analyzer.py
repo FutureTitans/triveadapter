@@ -21,6 +21,10 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import numpy as np
 import tempfile
 from pathlib import Path
+import torch
+import torchvision
+import torchvision.ops  # Force registration of torchvision::nms C++ operator
+
 
 logger = logging.getLogger(__name__)
 
