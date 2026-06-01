@@ -337,7 +337,11 @@ async def analyze_content(file_path: str = None, text: str = None) -> dict:
     model = get_model()
     preds_2d = None
 
-    if model is not None:
+    # Skip real inference on CPU — the pipeline downloads GBs of models
+    # (whisperx, Llama-3.2-3B, spacy) only to fail at the CUDA step.
+    gpu_available = torch.cuda.is_available()
+
+    if model is not None and gpu_available:
         try:
             if file_path:
                 ext = Path(file_path).suffix.lower()
