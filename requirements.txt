@@ -6,9 +6,9 @@ plotly==5.22.0
 nilearn==0.10.4
 nibabel>=4.0.0
 numpy<2.3
-torch>=2.5.1,<2.7
-torchaudio>=2.1.0
 python-dotenv==1.0.1
 aiofiles==24.1.0
-# Install tribev2 from GitHub:
-# pip install git+https://github.com/facebookresearch/tribev2.git
+# torch, torchvision, torchaudio are installed separately in the Dockerfile
+# (CPU-only builds from https://download.pytorch.org/whl/cpu).
+# Do NOT add them here — version constraints here can cause pip to downgrade
+# torch while leaving torchvision at a mismatched version, breaking C++ ops.

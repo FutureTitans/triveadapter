@@ -22,31 +22,39 @@ import numpy as np
 import tempfile
 from pathlib import Path
 import torch
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CRITICAL PATCH: Register missing C++ operators for torchvision.
-# On some CPU-only Docker builds, torchvision fails to load its C++ extension,
-# causing "operator torchvision::nms does not exist" when loading TorchScript models.
-# We register dummy operators directly into the PyTorch C++ dispatcher to bypass it.
-# ══════════════════════════════════════════════════════════════════════════════
-try:
-    torch.library.define("torchvision::nms", "(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor")
-    @torch.library.impl("torchvision::nms", "default")
-    def _dummy_nms(boxes, scores, iou_threshold):
-        return torch.arange(boxes.size(0), device=boxes.device)
-except Exception:
-    pass
-
-try:
-    torch.library.define("torchvision::roi_align", "(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned) -> Tensor")
-    @torch.library.impl("torchvision::roi_align", "default")
-    def _dummy_roi_align(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned):
-        return torch.zeros((rois.size(0), input.size(1), pooled_height, pooled_width), device=input.device)
-except Exception:
-    pass
-
 import torchvision
-import torchvision.ops  # Force registration of torchvision::nms C++ operator
+import torchvision.ops
+
+# Verify torchvision's C++ ops actually loaded.  If the torch/torchvision ABI
+# is mismatched (e.g. pip downgraded torch after torchvision was installed),
+# the _C extension silently fails and ops like nms are never registered.
+# In that case, register minimal Python stubs so TorchScript models that
+# reference these ops can still be loaded on CPU.
+_tv_ops_ok = True
+try:
+    _ = torch.ops.torchvision.nms
+except (AttributeError, RuntimeError):
+    _tv_ops_ok = False
+
+if not _tv_ops_ok:
+    logging.getLogger(__name__).warning(
+        "torchvision C++ ops not available — registering Python stubs for nms/roi_align"
+    )
+    try:
+        torch.library.define("torchvision::nms", "(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor")
+        @torch.library.impl("torchvision::nms", "default")
+        def _dummy_nms(boxes, scores, iou_threshold):
+            return torch.arange(boxes.size(0), device=boxes.device)
+    except Exception:
+        pass
+
+    try:
+        torch.library.define("torchvision::roi_align", "(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned) -> Tensor")
+        @torch.library.impl("torchvision::roi_align", "default")
+        def _dummy_roi_align(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned):
+            return torch.zeros((rois.size(0), input.size(1), pooled_height, pooled_width), device=input.device)
+    except Exception:
+        pass
 
 
 logger = logging.getLogger(__name__)
@@ -366,6 +374,11 @@ async def analyze_content(file_path: str = None, text: str = None) -> dict:
             logger.info("Falling back to mock brain data...")
             brain_data = _generate_mock_brain_data()
     else:
+        if os.getenv("HF_TOKEN"):
+            raise RuntimeError(
+                "TRIBE v2 model could not be loaded despite HF_TOKEN being set. "
+                "Check server logs for details."
+            )
         logger.info("Model not loaded. Falling back to mock brain data for analysis.")
         brain_data = _generate_mock_brain_data()
 

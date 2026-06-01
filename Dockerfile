@@ -22,14 +22,18 @@ WORKDIR /app
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 
-# Force install the CPU-only version of PyTorch so it literally has zero CUDA code
+# Install CPU-only PyTorch suite first (matched versions from the same index).
+# These must NOT appear in requirements.txt — a version constraint there can
+# cause pip to downgrade torch while leaving torchvision at a mismatched ABI,
+# which breaks torchvision's C++ ops (torchvision::nms, roi_align, etc.).
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining Python dependencies, ensuring any torch dependencies resolve to CPU
-RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+# Install remaining Python dependencies (torch is already satisfied above)
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install TRIBE v2 from GitHub (not on PyPI)
-RUN pip install --no-cache-dir git+https://github.com/facebookresearch/tribev2.git
+# Install TRIBE v2 from GitHub (not on PyPI).
+# --no-build-isolation ensures it sees the already-installed torch.
+RUN pip install --no-cache-dir --no-build-isolation git+https://github.com/facebookresearch/tribev2.git
 
 # Copy all backend files
 COPY . .
