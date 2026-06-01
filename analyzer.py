@@ -62,6 +62,21 @@ def get_model():
 
         tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio = _patched_get_transcript
 
+        # Monkey-patch neuralset's HuggingFaceText to use bfloat16 and low_cpu_mem_usage
+        # to prevent OOM when loading the 5GB Llama model on CPU
+        import neuralset.extractors.text
+        original_load_model = neuralset.extractors.text.HuggingFaceText._load_model
+
+        def _patched_load_model(self, **kwargs):
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cpu":
+                kwargs["torch_dtype"] = torch.bfloat16
+                kwargs["low_cpu_mem_usage"] = True
+            return original_load_model(self, **kwargs)
+
+        neuralset.extractors.text.HuggingFaceText._load_model = _patched_load_model
+
         os.makedirs(CACHE_DIR, exist_ok=True)
         hf_token = os.getenv("HF_TOKEN")
         logger.info("Loading TRIBE v2 model (first load downloads ~10GB)...")
