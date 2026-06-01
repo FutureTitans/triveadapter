@@ -81,7 +81,7 @@ def get_model():
                     from transformers import AutoModelForTextEncoding as Model
                 elif "Phi-3" in self.model_name:
                     from transformers import AutoModelForCausalLM as Model
-                elif "Llama-3.2" in self.model_name:
+                elif "Llama-3.2-11B-Vision" in self.model_name:
                     from transformers import MllamaForConditionalGeneration as Model
                 else:
                     Model = AutoModel
