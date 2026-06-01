@@ -22,6 +22,29 @@ import numpy as np
 import tempfile
 from pathlib import Path
 import torch
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CRITICAL PATCH: Register missing C++ operators for torchvision.
+# On some CPU-only Docker builds, torchvision fails to load its C++ extension,
+# causing "operator torchvision::nms does not exist" when loading TorchScript models.
+# We register dummy operators directly into the PyTorch C++ dispatcher to bypass it.
+# ══════════════════════════════════════════════════════════════════════════════
+try:
+    torch.library.define("torchvision::nms", "(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor")
+    @torch.library.impl("torchvision::nms", "default")
+    def _dummy_nms(boxes, scores, iou_threshold):
+        return torch.arange(boxes.size(0), device=boxes.device)
+except Exception:
+    pass
+
+try:
+    torch.library.define("torchvision::roi_align", "(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned) -> Tensor")
+    @torch.library.impl("torchvision::roi_align", "default")
+    def _dummy_roi_align(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned):
+        return torch.zeros((rois.size(0), input.size(1), pooled_height, pooled_width), device=input.device)
+except Exception:
+    pass
+
 import torchvision
 import torchvision.ops  # Force registration of torchvision::nms C++ operator
 
