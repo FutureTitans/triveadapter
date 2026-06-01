@@ -1,0 +1,258 @@
+"""
+analyzer.py — TRIBE v2 brain encoding inference logic.
+
+Loads Meta's TRIBE v2 model, processes video/audio/text inputs,
+and returns brain activation predictions with ROI scores.
+"""
+
+import os
+import numpy as np
+import tempfile
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# ── Model Singleton ──────────────────────────────────────────────────────────
+_model = None
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
+
+
+def get_model():
+    """
+    Lazy-load the TRIBE v2 model. Caches to ./cache to avoid
+    re-downloading the ~10GB weights on every restart.
+    """
+    global _model
+    if _model is not None:
+        return _model
+
+    try:
+        from tribev2 import TribeModel
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        hf_token = os.getenv("HF_TOKEN")
+        logger.info("Loading TRIBE v2 model (first load downloads ~10GB)...")
+        _model = TribeModel.from_pretrained(
+            "facebook/tribev2",
+            cache_folder=CACHE_DIR,
+            token=hf_token,
+        )
+        logger.info("TRIBE v2 model loaded successfully.")
+        return _model
+    except Exception as e:
+        logger.warning(f"TRIBE v2 model unavailable: {e}.")
+        return None
+
+
+# ── ROI Region Mapping (fsaverage5 vertex index ranges) ──────────────────────
+# These are approximate vertex ranges for key brain regions on the fsaverage5
+# mesh (~20,484 vertices). In production, use Nilearn's parcellation atlas.
+ROI_REGIONS = {
+    "visual_cortex":     (16000, 18000),  # Occipital lobe
+    "auditory_cortex":   (10000, 12000),  # Superior temporal
+    "language_areas":    (8000, 10000),   # Broca's + Wernicke's
+    "attention_network": (4000, 6000),    # Dorsal parietal
+    "emotion_centers":   (2000, 4000),    # Amygdala / insula region
+    "memory_encoding":   (12000, 14000),  # Medial temporal
+}
+
+
+def _compute_roi_scores(brain_data: np.ndarray) -> dict:
+    """Compute 0-100 scores for each ROI by averaging vertex activations."""
+    roi_scores = {}
+    global_min = brain_data.min()
+    global_max = brain_data.max()
+    spread = global_max - global_min if global_max != global_min else 1.0
+
+    for region, (start, end) in ROI_REGIONS.items():
+        end = min(end, len(brain_data))
+        start = min(start, end)
+        region_mean = brain_data[start:end].mean()
+        # Normalize to 0-100
+        score = float(((region_mean - global_min) / spread) * 100)
+        roi_scores[region] = round(max(0, min(100, score)), 1)
+
+    return roi_scores
+
+
+def _compute_timeline(brain_data: np.ndarray, duration_seconds: int = 30) -> list:
+    """
+    Create a per-second engagement timeline by chunking the vertex array
+    into `duration_seconds` segments and computing mean activation.
+    """
+    n_vertices = len(brain_data)
+    chunk_size = max(1, n_vertices // duration_seconds)
+    timeline = []
+
+    for t in range(duration_seconds):
+        start = t * chunk_size
+        end = min(start + chunk_size, n_vertices)
+        score = float(brain_data[start:end].mean())
+        timeline.append({"time": t, "engagement_score": round(score, 4)})
+
+    # Normalize scores to 0-100
+    scores = [t["engagement_score"] for t in timeline]
+    min_s, max_s = min(scores), max(scores)
+    spread = max_s - min_s if max_s != min_s else 1.0
+    for t in timeline:
+        t["engagement_score"] = round(
+            ((t["engagement_score"] - min_s) / spread) * 100, 1
+        )
+
+    return timeline
+
+
+def _find_peak_moments(timeline: list, top_k: int = 5) -> list:
+    """Find the top-K time indices with highest engagement scores."""
+    sorted_moments = sorted(timeline, key=lambda x: x["engagement_score"], reverse=True)
+    return sorted_moments[:top_k]
+
+
+def _determine_dominant_modality(roi_scores: dict) -> str:
+    """Determine which modality is most activated."""
+    modality_map = {
+        "visual": roi_scores.get("visual_cortex", 0),
+        "auditory": roi_scores.get("auditory_cortex", 0),
+        "language": roi_scores.get("language_areas", 0),
+    }
+    return max(modality_map, key=modality_map.get)
+
+
+def _calculate_viral_score(roi_scores: dict) -> float:
+    """
+    Composite viral score: weighted average of ROI activations.
+    Attention and emotion weigh more heavily for viral potential.
+    """
+    weights = {
+        "visual_cortex": 0.15,
+        "auditory_cortex": 0.10,
+        "language_areas": 0.15,
+        "attention_network": 0.25,
+        "emotion_centers": 0.25,
+        "memory_encoding": 0.10,
+    }
+    score = sum(roi_scores[k] * weights[k] for k in weights)
+    return round(max(0, min(100, score)), 1)
+
+
+def _generate_mock_brain_data() -> np.ndarray:
+    """Generate realistic mock brain data when the real model isn't available."""
+    np.random.seed(42)
+    n_vertices = 20484  # fsaverage5
+
+    # Start with a base pattern
+    base = np.random.randn(n_vertices) * 0.3
+
+    # Add regional hotspots for more realistic patterns
+    for region, (start, end) in ROI_REGIONS.items():
+        intensity = np.random.uniform(0.3, 1.0)
+        base[start:end] += np.random.randn(end - start) * intensity + intensity
+
+    return base
+
+
+async def analyze_content(file_path: str = None, text: str = None) -> dict:
+    """
+    Main analysis pipeline. Accepts a file path (video/audio) or raw text.
+    Returns brain activation data, ROI scores, timeline, and viral score.
+    """
+    model = get_model()
+    preds_2d = None  # (n_timesteps, n_vertices) for real temporal data
+
+    if model is not None:
+        # ── Real TRIBE v2 inference ──────────────────────────────────────
+        try:
+            if file_path:
+                ext = Path(file_path).suffix.lower()
+                if ext in ('.mp4', '.mov'):
+                    events_df = model.get_events_dataframe(video_path=file_path)
+                elif ext in ('.mp3', '.wav'):
+                    events_df = model.get_events_dataframe(audio_path=file_path)
+                elif ext == '.txt':
+                    events_df = model.get_events_dataframe(text_path=file_path)
+                else:
+                    events_df = model.get_events_dataframe(video_path=file_path)
+                preds, segments = model.predict(events=events_df)
+            elif text:
+                # For text, create a temporary file
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".txt", delete=False
+                ) as f:
+                    f.write(text)
+                    tmp_path = f.name
+                try:
+                    events_df = model.get_events_dataframe(text_path=tmp_path)
+                    preds, segments = model.predict(events=events_df)
+                finally:
+                    os.unlink(tmp_path)
+            else:
+                raise ValueError("No file or text provided")
+
+            preds = np.array(preds, dtype=np.float64)
+
+            # preds is (n_timesteps, n_vertices)
+            if preds.ndim > 1:
+                preds_2d = preds
+                brain_data = preds.mean(axis=0)  # Average over time for spatial map
+            else:
+                brain_data = preds
+
+        except Exception as e:
+            logger.error(f"TRIBE v2 inference failed: {e}")
+            raise RuntimeError(f"Brain analysis failed: {e}")
+    else:
+        # ── Model not available — raise error if HF_TOKEN is set ─────────
+        hf_token = os.getenv("HF_TOKEN")
+        if hf_token:
+            raise RuntimeError(
+                "TRIBE v2 model could not be loaded despite HF_TOKEN being set. "
+                "Check server logs for details."
+            )
+        raise RuntimeError(
+            "TRIBE v2 model is not available. Set HF_TOKEN in environment to enable brain analysis."
+        )
+
+    # ── Compute derived metrics ──────────────────────────────────────────
+    roi_scores = _compute_roi_scores(brain_data)
+
+    # Use real temporal data if available, otherwise approximate from spatial
+    if preds_2d is not None and preds_2d.shape[0] > 1:
+        timeline = _compute_timeline_from_temporal(preds_2d)
+    else:
+        timeline = _compute_timeline(brain_data)
+
+    peak_moments = _find_peak_moments(timeline)
+    viral_score = _calculate_viral_score(roi_scores)
+    dominant_modality = _determine_dominant_modality(roi_scores)
+
+    return {
+        "brain_data": brain_data.tolist(),
+        "timeline": timeline,
+        "peak_moments": peak_moments,
+        "roi_scores": roi_scores,
+        "viral_score": viral_score,
+        "dominant_modality": dominant_modality,
+    }
+
+
+def _compute_timeline_from_temporal(preds_2d: np.ndarray) -> list:
+    """
+    Compute engagement timeline from real temporal predictions.
+    preds_2d is (n_timesteps, n_vertices) — each row is one TR (~1-2 seconds).
+    """
+    # Mean activation across all vertices per timestep
+    mean_per_timestep = preds_2d.mean(axis=1)
+
+    # Normalize to 0-100
+    min_s = mean_per_timestep.min()
+    max_s = mean_per_timestep.max()
+    spread = max_s - min_s if max_s != min_s else 1.0
+    normalized = ((mean_per_timestep - min_s) / spread) * 100
+
+    timeline = []
+    for t, score in enumerate(normalized):
+        timeline.append({"time": t, "engagement_score": round(float(score), 1)})
+
+    return timeline
+

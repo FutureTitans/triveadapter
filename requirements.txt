@@ -1,0 +1,14 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+anthropic>=0.100.0
+plotly==5.22.0
+nilearn==0.10.4
+nibabel>=4.0.0
+numpy<2.3
+torch>=2.5.1,<2.7
+torchaudio>=2.1.0
+python-dotenv==1.0.1
+aiofiles==24.1.0
+# Install tribev2 from GitHub:
+# pip install git+https://github.com/facebookresearch/tribev2.git
