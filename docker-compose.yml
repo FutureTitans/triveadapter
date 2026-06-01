@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "7860:7860"
+      - "80:7860"
     environment:
       - HF_TOKEN=${HF_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
