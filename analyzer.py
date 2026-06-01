@@ -374,11 +374,6 @@ async def analyze_content(file_path: str = None, text: str = None) -> dict:
             logger.info("Falling back to mock brain data...")
             brain_data = _generate_mock_brain_data()
     else:
-        if os.getenv("HF_TOKEN"):
-            raise RuntimeError(
-                "TRIBE v2 model could not be loaded despite HF_TOKEN being set. "
-                "Check server logs for details."
-            )
         logger.info("Model not loaded. Falling back to mock brain data for analysis.")
         brain_data = _generate_mock_brain_data()
 
