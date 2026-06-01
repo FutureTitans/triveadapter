@@ -36,7 +36,6 @@ def get_model():
         _model = TribeModel.from_pretrained(
             "facebook/tribev2",
             cache_folder=CACHE_DIR,
-            token=hf_token,
         )
         logger.info("TRIBE v2 model loaded successfully.")
         return _model
