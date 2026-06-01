@@ -23,7 +23,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Force install the CPU-only version of PyTorch so it literally has zero CUDA code
-RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # Install remaining Python dependencies, ensuring any torch dependencies resolve to CPU
 RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
