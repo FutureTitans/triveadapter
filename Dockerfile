@@ -22,8 +22,11 @@ WORKDIR /app
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Force install the CPU-only version of PyTorch so it literally has zero CUDA code
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining Python dependencies, ensuring any torch dependencies resolve to CPU
+RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Install TRIBE v2 from GitHub (not on PyPI)
 RUN pip install --no-cache-dir git+https://github.com/facebookresearch/tribev2.git
