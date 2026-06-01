@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+# Force CPU-only mode at the OS level, BEFORE Python/PyTorch starts.
+# This makes torch.cuda.is_available() return False globally.
+ENV CUDA_VISIBLE_DEVICES=""
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
