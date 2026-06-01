@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv (provides uvx command, required by TRIBE v2 for whisperx)
+RUN pip install --no-cache-dir uv
+
 # Set working directory
 WORKDIR /app
 
