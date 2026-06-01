@@ -62,8 +62,8 @@ def get_model():
 
         tribev2.eventstransforms.ExtractWordsFromAudio._get_transcript_from_audio = _patched_get_transcript
 
-        # Monkey-patch neuralset's HuggingFaceText to use bfloat16 and low_cpu_mem_usage
-        # to prevent OOM when loading the 5GB Llama model on CPU
+        # Monkey-patch neuralset's HuggingFaceText to use float32 or int8
+        # and print the exact exception if it fails
         import neuralset.extractors.text
         original_load_model = neuralset.extractors.text.HuggingFaceText._load_model
 
@@ -71,11 +71,38 @@ def get_model():
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
             if device == "cpu":
-                kwargs["torch_dtype"] = torch.bfloat16
                 kwargs["low_cpu_mem_usage"] = True
+                # Let's try float32 but rely on swap, or if bfloat16 fails it will tell us.
+                kwargs["torch_dtype"] = torch.bfloat16 
             return original_load_model(self, **kwargs)
 
         neuralset.extractors.text.HuggingFaceText._load_model = _patched_load_model
+
+        # Also patch the property to print the real error
+        original_model_prop = neuralset.extractors.text.HuggingFaceText.model
+        @property
+        def _patched_model_prop(self):
+            if not hasattr(self, "_model"):
+                from transformers import AutoTokenizer
+                kwargs = {}
+                if self.model_name.lower().startswith("microsoft/phi"):
+                    kwargs["trust_remote_code"] = True
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_name, truncation_side="left", **kwargs
+                )
+                if self._tokenizer.pad_token is None:
+                    self._tokenizer.pad_token = self._tokenizer.eos_token
+                self._pad_id = self._tokenizer.eos_token_id
+                try:
+                    self._model = self._load_model()
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    logger.error(f"REAL LLAMA ERROR: {str(e)}")
+                    raise RuntimeError(f"Model loading went wrong: {str(e)}") from e
+            return self._model
+            
+        neuralset.extractors.text.HuggingFaceText.model = _patched_model_prop
 
         os.makedirs(CACHE_DIR, exist_ok=True)
         hf_token = os.getenv("HF_TOKEN")
