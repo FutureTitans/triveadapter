@@ -71,8 +71,8 @@ def get_model():
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
             if device == "cpu":
+                self.device = "cpu"  # Force the model to load on CPU!
                 kwargs["low_cpu_mem_usage"] = True
-                # Let's try float32 but rely on swap, or if bfloat16 fails it will tell us.
                 kwargs["torch_dtype"] = torch.bfloat16 
             return original_load_model(self, **kwargs)
 
